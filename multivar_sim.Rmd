@@ -1,0 +1,443 @@
+---
+title: "multivar_sim"
+author: "Harrison Li"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(SuperLearner)
+library(tidyverse)
+library(grf)
+PATH <- "/Users/harrisonli/Documents/GitHub.nosync/calibrating_large_scale_observations/"
+source(paste0(PATH, "helpers.R"))
+```
+
+## Global constants
+
+```{r}
+K_cf <- 5 # number of cross-fitting folds for learning \mu
+```
+
+# Specify DGP
+
+```{r}
+# Ensure X has at least 2 dimensions
+dimcheck <- function(X, min_dim=2) {
+  stopifnot(ncol(X) >= min_dim)
+}
+```
+
+```{r}
+m_fun <- function(X, q, interact, beta) {
+  len_check <- check_len_two(beta)
+  X <- as.matrix(X)
+  dimcheck(X)
+  Delta <- plogis(0.5*X[,1]) * plogis(1-0.5*X[,2]) # (1-2*pnorm(-0.5*X[,2]))
+  m0 <- sin(X[,1])+cos(X[,2])+sin(2*X[,1])*cos(2*X[,2])+0.5*rowSums(X)
+  m1 <- m0 + Delta
+  m2 <- beta[1] + beta[2] * Delta + interact*(X[,1]+1)*(X[,2]+1)
+  return((q==0)*m0 + (q==1)*m1 + (q==2)*m2)
+}
+```
+
+```{r}
+r_fun <- function(X) {
+  X <- as.matrix(X)
+  dimcheck(X)
+  return(pnorm((2*X[,2]-X[,1]) / 5))
+}
+```
+
+```{r}
+# Specify \pi(x) = P(Q=2 | X=x)
+pi_fun <- function(X, n, N, mu0, mu1, var0, var1) {
+  rho <- n / (n + N)
+  X <- as.matrix(X)
+  dimcheck(X)
+  f_rct <- apply(dnorm(X, mean=mu1, sd=sqrt(var1)), MARGIN=1, prod)
+  f_obs <- apply(dnorm(X, mean=mu0, sd=sqrt(var0)), MARGIN=1, prod)
+  x_den <- f_rct * rho + f_obs * (1-rho)
+  return(f_rct * rho / x_den) # Bayes' rule
+}
+```
+
+```{r}
+# Compute true params for simulations
+get_true_params <- function(beta, interact, mu0, mu1, var0, var1) {
+  len_check <- check_len_two(beta)
+  
+  ## Compute densities of covariate distributions
+  f_rct <- function(x) { 
+    dnorm(x, mean=mu1, sd=sqrt(var1)) 
+  }
+  f_obs <- function(x) {
+    dnorm(x, mean=mu0, sd=sqrt(var0))
+  }
+  
+  ## Compute true ATE on target population
+  plogis_mean_obs <- integrate(f=function(x) plogis(0.5*x)*f_obs(x), lower=-Inf, upper=Inf)$value
+  pnorm_mean_obs <- integrate(f=function(x) plogis(1-0.5*x)*f_obs(x), lower=-Inf, upper=Inf)$value
+  Delta_mean_obs <- plogis_mean_obs * pnorm_mean_obs
+  tau <- beta[1] + beta[2] * Delta_mean_obs + interact * (mu0 + 1) * (mu0 + 1)
+  
+  ## Helper quantities
+  plogis_mean_rct <- integrate(f=function(x) plogis(0.5*x)*f_rct(x), lower=-Inf, upper=Inf)$value
+  pnorm_mean_rct <- integrate(f=function(x) plogis(1-0.5*x)*f_rct(x), lower=-Inf, upper=Inf)$value
+  Delta_mean_rct <- plogis_mean_rct * pnorm_mean_rct
+  plogis_sq_mean <- integrate(f=function(x) plogis(0.5*x)^2*f_rct(x), lower=-Inf, upper=Inf)$value
+  pnorm_sq_mean <- integrate(f=function(x) plogis(1-0.5*x)^2*f_rct(x), lower=-Inf, upper=Inf)$value
+  Delta_sq_mean_rct <- plogis_sq_mean * pnorm_sq_mean
+  
+  ## True ATE on RCT population
+  mean_y_rct <- beta[1] + beta[2] * Delta_mean_rct + interact * (mu1 + 1) * (mu1 + 1)
+  
+  ## Compute E_{rct}[Y*Delta(x)]
+  interact_plogis_mean_rct <- integrate(f=function(x) plogis(0.5*x)*(x+1)*f_rct(x), lower=-Inf, upper=Inf)$value
+  interact_pnorm_mean_rct <- integrate(f=function(x) plogis(1-0.5*x)*(x+1)*f_rct(x), lower=-Inf, upper=Inf)$value
+  mean_y_Delta_rct <- beta[1] * Delta_mean_rct + beta[2] * Delta_sq_mean_rct + interact * interact_plogis_mean_rct * interact_pnorm_mean_rct
+  
+  ## Compute beta_bar
+  Mat <- matrix(c(1, Delta_mean_rct,
+                  Delta_mean_rct, Delta_sq_mean_rct), nrow=2)
+  beta_bar <- (solve(Mat) %*% c(mean_y_rct, mean_y_Delta_rct))
+ 
+  # Projected ATE
+  tau_bar <- beta_bar[1] + beta_bar[2] * Delta_mean_obs 
+  
+  return(list(tau=tau, tau_bar=tau_bar, beta_bar=beta_bar))
+}
+```
+
+```{r}
+# Function to generate simulated data
+gen_data <- function(n, N, dim, mu0, mu1, var0, var1, interact, beta, seed=NULL) {
+
+  ## Generate X
+  set.seed(seed)
+  X_rct <- matrix(rnorm(dim*n, mean=mu1, sd=sqrt(var1)), ncol=dim)
+  X_obs <- matrix(rnorm(dim*N, mean=mu0, sd=sqrt(var0)), ncol=dim)
+
+  ## Instantiate mean functions
+  m0 <- function(X) m_fun(X, q=0, interact=interact, beta=beta)
+  m1 <- function(X) m_fun(X, q=1, interact=interact, beta=beta)
+  m2 <- function(X) m_fun(X, q=2, interact=interact, beta=beta)
+
+  ## Generate y, z
+  y_rct <- m2(X_rct) + rnorm(n, sd=1)
+  z_obs <- rbinom(n=N, size=1, prob=r_fun(X_obs))
+  y_obs <- z_obs * m1(X_obs) + (1-z_obs) * m0(X_obs) + rnorm(N, sd=1)
+
+  ## Put together into data frame
+  rct_df <- data.frame(X_rct) %>%
+    mutate(y=y_rct, z=0)
+  colnames(rct_df) <- c(paste0("x", 1:dim), "y", "z")
+  obs_df <- data.frame(X_obs) %>%
+    mutate(y=y_obs, z=z_obs)
+  colnames(obs_df) <- c(paste0("x", 1:dim), "y", "z")
+  return(list(rct_df=rct_df, obs_df=obs_df))
+}
+```
+
+# Run simple sim
+
+```{r}
+run_simple_sims <- function(n_sims, n, N, dim, mu0, mu1, var0, var1, interact, 
+                            beta, K_cf, init_seed=NULL) {
+  
+  if (dim < 2) {
+    stop("only dim > 1 supported")
+  }
+
+  # Preallocate data frames for estimators and CI's
+  aipsw <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                      ci_upper=rep(NA, n_sims))
+  or <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                   ci_upper=rep(NA, n_sims))
+  collab <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                        ci_upper=rep(NA, n_sims))
+  aipsw_extrap <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                            ci_upper=rep(NA, n_sims))
+  or_extrap <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                         ci_upper=rep(NA, n_sims))
+  collab_extrap <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                               ci_upper=rep(NA, n_sims))
+  aipsw_oracle <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                             ci_upper=rep(NA, n_sims))
+  or_oracle <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                          ci_upper=rep(NA, n_sims))
+  or_bar_oracle <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                              ci_upper=rep(NA, n_sims))
+  or_Delta_oracle <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                              ci_upper=rep(NA, n_sims))
+  beta_hats <-  matrix(NA, nrow=n_sims, ncol=2)
+  
+  for (i in 1:n_sims) {
+    ## Set seed
+    if (is.null(init_seed)) {
+      curr_seed <- NULL
+    } else {
+      curr_seed <- init_seed + i - 1
+    }
+    
+    ## Generate simulated data
+    data <- gen_data(n=n, N=N, dim=dim, mu0=mu0, mu1=mu1, var0=var0, var1=var1, 
+                     interact=interact, beta=beta, seed=curr_seed)
+    rct_df <- data$rct_df
+    obs_df <- data$obs_df
+
+    # Compute nuisance estimates
+    x_names <- paste0("x", 1:dim)
+  
+    x_rct <- as.matrix(rct_df[,x_names])
+    x_obs <- as.matrix(obs_df[,x_names])
+    x_obs_ctl <- as.matrix(x_obs[obs_df$z==0,])
+
+    ## learn Delta via causal forest
+    Delta_forest <- causal_forest(X=x_obs, Y=obs_df$y, W=obs_df$z, seed=curr_seed)
+
+    ## compute nuisance predictions and add them as columns to dataset
+    rct_df$Delta_hat <- predict(Delta_forest, newdata=x_rct)$predictions
+    obs_df$Delta_hat <- predict(Delta_forest)$predictions
+    all_df <- rbind(rct_df, obs_df)
+    
+    ## learn pi via logistic regression, following Zhang et al. (2023)
+    all_df$s <- c(rep(1, n), rep(0, N))
+    form_pi_hat <- paste("s ~", paste(x_names, collapse = " + "))
+    pi_hat_model <- glm(form_pi_hat, data=all_df, family=binomial(link="logit"))
+    all_df$pi_hat <- predict(pi_hat_model, type="response")
+
+    ## estimate beta, and use to estimate m1
+    naive_lm <- lm(y ~ Delta_hat, data=rct_df)
+    beta_hat <- coef(naive_lm)
+    all_df$mu_hat <- beta_hat[1] + beta_hat[2] * all_df$Delta_hat
+
+    ## estimate g via logistic gam
+    g_hat_reg <- mgcv::gam(s ~ s(mu_hat), family=binomial(link=logit), data=all_df)
+    all_df$g_hat <- predict(g_hat_reg, type="response")
+
+    ## estimate k via GAM
+    k_hat_reg <- mgcv::gam(mu_hat ~ s(pi_hat), data=all_df)
+    all_df$k_hat <- predict(k_hat_reg, type="response")
+
+    ## estimate m1 as a function of both x and Delta_hat(x), and extrapolate
+    ## this is what you would do if you believed there is overlap
+    rct_fold_inds <- get_fold_inds(n=n, K=K_cf, seed=curr_seed) # RCT cross-fitting folds
+    rct_df_extrap <- all_df[all_df$s==1,]
+    rct_df_extrap$mu_hat <- NA
+    mu_models <- vector("list", K_cf)
+    set.seed(curr_seed)
+    for (k in 1:K_cf) {
+      fold_inds <- rct_fold_inds == k
+      curr_train <- rct_df_extrap[!fold_inds,]
+      curr_val <- rct_df_extrap[fold_inds,]
+      mu_model_extrap <- SuperLearner(Y=curr_train$y,
+                                      X=curr_train[,c(x_names, "Delta_hat")],
+                                      SL.library=c("SL.glmnet", "SL.earth",
+                                                   "SL.randomForest", "SL.svm"))
+      mu_models[[k]] <- mu_model_extrap
+      rct_df_extrap$mu_hat[fold_inds] <- predict(mu_model_extrap,
+                                                 newdata=curr_val[,c(x_names, "Delta_hat")])$pred
+    }
+
+    ## Compute predictions on observational dataset by averaging predictions from all K_cf cross-fit models
+    obs_df_extrap <- all_df[all_df$s==0,]
+    obs_df_extrap$mu_hat <- rowMeans(sapply(mu_models, function(m) predict(m, newdata=obs_df_extrap[,c(x_names, "Delta_hat")])$pred))
+    all_df_extrap <- rbind(rct_df_extrap, obs_df_extrap)
+    
+    ## generate oracle data frame (knows all nuisance functions)
+    all_df_oracle <- all_df[,c("s", "y", x_names)]
+    all_df_oracle$Delta_hat <- m_fun(all_df_oracle[,x_names], q=1, interact=interact, beta=beta) - m_fun(all_df_oracle[,x_names], q=0, interact=interact, beta=beta)
+    all_df_oracle$pi_hat <- pi_fun(all_df_oracle[,x_names], n=n, N=N, mu0=mu0, mu1=mu1, var0=var0, var1=var1)
+    all_df_oracle$mu_hat <- m_fun(all_df_oracle[,x_names], q=2, interact=interact, beta=beta)
+    
+    ## generate oracle Delta data frame (knows Delta)
+    naive_lm <- lm(y ~ Delta_hat, data=all_df_oracle, subset=all_df_oracle$s==1)
+    beta_hat_Delta_oracle <- coef(naive_lm)
+    all_df_oracle_Delta <- all_df_oracle
+    all_df_oracle_Delta$mu_hat <- beta_hat_Delta_oracle[1] + beta_hat_Delta_oracle[2] * all_df_oracle_Delta$Delta_hat
+    
+    ## generate oracle data frame for outcome regression bar
+    all_df_oracle_bar <- all_df_oracle # actually mu_bar
+    oracle_params <- get_true_params(beta=beta, interact=interact,
+                                     mu0=mu0, mu1=mu1, var0=var0, var1=var1)
+    all_df_oracle_bar$mu_hat <- oracle_params$beta_bar[1] + oracle_params$beta_bar[2] * all_df_oracle_bar$Delta_hat
+    
+    # Compute final estimators
+    aipsw[i,] <- compute_estimator_and_ci(all_df, type="aipsw")
+    aipsw_extrap[i,] <- compute_estimator_and_ci(all_df_extrap, type="aipsw")
+    aipsw_oracle[i,] <- compute_estimator_and_ci(all_df_oracle, type="aipsw")
+    collab[i,] <- compute_estimator_and_ci(all_df, type="collab")
+    collab_extrap[i,] <- compute_estimator_and_ci(all_df_extrap, type="collab")
+    or[i,] <- compute_estimator_and_ci(all_df, type="or")
+    or_extrap[i,] <- compute_estimator_and_ci(all_df_extrap, type="or")
+    or_oracle[i,] <- compute_estimator_and_ci(all_df_oracle, type="or")
+    or_bar_oracle[i,] <- compute_estimator_and_ci(all_df_oracle_bar, type="or")
+    or_Delta_oracle[i,] <- compute_estimator_and_ci(all_df_oracle_Delta, type="or")
+    
+    # Store beta_hat
+    beta_hats[i,] <- beta_hat
+  }
+  sim_params <- list(n=n, N=N, dim=dim, mu0=mu0, mu1=mu1, var0=var0, var1=var1, 
+                     interact=interact, beta=beta, init_seed=init_seed)
+  return(list(aipsw=aipsw, collab=collab, or=or, 
+              aipsw_extrap=aipsw_extrap, collab_extrap=collab_extrap, or_extrap=or_extrap,
+              aipsw_oracle=aipsw_oracle, or_oracle=or_oracle, or_bar_oracle=or_bar_oracle,
+              or_Delta_oracle=or_Delta_oracle, beta_hats=beta_hats, sim_params=sim_params))
+}
+```
+
+```{r}
+# # Run correctly specified sims
+# sim_params <- list(n_sims=1000, n=100, N=10000, dim=10, mu0=0, mu1=0.5, var0=1, var1=1,
+#                    interact=0, beta=c(0.5, 0.5), K_cf=K_cf, init_seed=1)
+# sim_results <- do.call(run_simple_sims, sim_params)
+```
+
+```{r}
+# sim_params_2 <- list(n_sims=1000, n=100, N=10000, dim=10, mu0=0, mu1=0.5, var0=2, var1=1,
+#                      interact=0, beta=c(0.5, 0.5), K_cf=K_cf, init_seed=1)
+# sim_results_2 <- do.call(run_simple_sims, sim_params_2)
+```
+
+```{r}
+# # Run misspecified sim
+# sim_params_interact <- list(n_sims=1000, n=100, N=10000, dim=10, mu0=0, mu1=0.5, var0=1, var1=1,
+#                             interact=0.5, beta=c(0.5, 0.5), K_cf=K_cf, init_seed=1)
+# sim_results_interact <- do.call(run_simple_sims, sim_params_interact)
+```
+
+```{r}
+# sim_params_interact_2 <- list(n_sims=1000, n=100, N=10000, dim=10, mu0=0, mu1=0.5, var0=2, var1=1,
+#                             interact=0.5, beta=c(0.5, 0.5), K_cf=K_cf, init_seed=1)
+# sim_results_interact_2 <- do.call(run_simple_sims, sim_params_interact_2)
+```
+
+```{r}
+# saveRDS(sim_results, paste0(PATH, "sim_results.rds"))
+# saveRDS(sim_results_2, paste0(PATH, "sim_results_2.rds"))
+# saveRDS(sim_results_interact, paste0(PATH, "sim_results_interact.rds"))
+# saveRDS(sim_results_interact_2, paste0(PATH, "sim_results_interact_2.rds"))
+```
+
+## Plot results
+
+```{r}
+evaluate_sim_results <- function(sim_res) {
+  sim_params <- sim_res$sim_params
+  rho <- with(sim_params, n/(n+N))
+  
+  params <- with(sim_params, get_true_params(beta, interact, mu0, mu1, var0, var1))
+  
+  # Compute summary stats
+  sim_ests <- sim_res[1:(length(sim_res)-2)]
+  mse <- sapply(sim_ests, function(est_df) mean((est_df$theta_hat-params$tau)^2))
+  mse_bar <- sapply(sim_ests, function(est_df) mean((est_df$theta_hat-params$tau_bar)^2))
+  bias <- sapply(sim_ests, function(est_df) mean(est_df$theta_hat) - params$tau)
+  bias_bar <- sapply(sim_ests, function(est_df) mean(est_df$theta_hat) - params$tau_bar)
+  vrnce <- sapply(sim_ests, function(est_df) var(est_df$theta_hat))
+  cvg <- sapply(sim_ests, function(est_df) mean((est_df$ci_lower <= params$tau & est_df$ci_upper >= params$tau)))
+  cvg_bar <- sapply(sim_ests, function(est_df) mean((est_df$ci_lower <= params$tau_bar & est_df$ci_upper >= params$tau_bar)))
+  widths <- sapply(sim_ests, function(est_df) mean(est_df$ci_upper - est_df$ci_lower))
+  
+  # beta_bar
+  n_sim <- nrow(sim_ests[[1]])
+  beta_hat_bar_df <- data.frame(int_mean=mean(sim_res$beta_hats[,1]),
+                                slope_mean=mean(sim_res$beta_hats[,2]),
+                                int_se=sd(sim_res$beta_hats[,1])/sqrt(n_sim),
+                                slope_se=sd(sim_res$beta_hats[,2])/sqrt(n_sim),
+                                int_bar=params$beta_bar[1],
+                                slope_bar=params$beta_bar[2])
+  
+  # Aggregate results into data frame
+  res_df <- data.frame(mse=mse, mse_bar=mse_bar, bias=bias, bias_bar=bias_bar,
+                       vrnce=vrnce, cvg=cvg, cvg_bar=cvg_bar, widths=widths)
+  return(list(res_df=res_df, beta_hat_bar_df=beta_hat_bar_df, 
+              beta_hats=sim_res$beta_hats, sim_params=sim_params,
+              params=params))
+}
+```
+
+```{r}
+sim_results <- readRDS(paste0(PATH, "sim_results.rds"))
+sim_results_2 <- readRDS(paste0(PATH, "sim_results_2.rds"))
+sim_results_interact <- readRDS(paste0(PATH, "sim_results_interact.rds"))
+sim_results_interact_2 <- readRDS(paste0(PATH, "sim_results_interact_2.rds"))
+```
+
+```{r}
+all_sim_results <- list(sim_results, sim_results_2, sim_results_interact, sim_results_interact_2)
+eval_results <- lapply(all_sim_results, evaluate_sim_results)
+```
+
+```{r}
+convert_to_plot_df <- function(eval_results, colnames) {
+  res_list <- lapply(eval_results, function(res) {
+    raw_df <- as.data.frame(res$res_df[colnames])
+    stopifnot(!any(grepl(";", colnames(raw_df))))
+    colnames(raw_df) <- paste(colnames(raw_df), res$sim_params$var0, res$sim_params$interact, sep=";")
+    return(raw_df)
+  })
+  plot_df <- do.call(cbind, res_list) %>%
+    rownames_to_column(var="estimator") %>%
+    pivot_longer(cols=-c("estimator"), names_to=c("metric", "var0", "interact"), 
+                 names_sep=";", values_to="value")
+  return(plot_df)
+}
+```
+
+```{r}
+# Generate plot df
+plot_df <- convert_to_plot_df(eval_results,
+                              colnames=c("mse", "mse_bar", "cvg", "cvg_bar", "bias", "bias_bar", "vrnce", "widths"))
+```
+
+```{r}
+# MSE plot
+plot_df %>%
+  filter((metric %in% c("vrnce", "bias_bar") & estimator == "or") | (metric %in% c("vrnce", "bias") & estimator %in% c("aipsw_extrap", "collab_extrap"))) %>%
+  mutate(metric=ifelse(metric=="vrnce", "vrnce", "bias_sq"),
+         value=ifelse(metric=="bias_sq", value^2, value)) %>% # get sq. bias
+  ggplot(aes(x=estimator, y=value, fill=estimator, alpha=metric)) +
+  facet_wrap(~ interact + var0, nrow=1, scales="free",
+             labeller=label_bquote(atop(eta == .(interact),
+                                        sigma[0]^2 == .(var0)
+                                        ))) +
+  geom_col(position="stack", color="black") +
+  scale_alpha_manual(
+    values = c("vrnce" = 1, "bias_sq" = 0),
+    guide = "none" # Hide the fill legend if it's confusing
+  ) +
+  scale_fill_brewer(
+    palette = "Set1",
+    labels = c("aipsw_extrap" = expression(hat(tau)[aipsw]), 
+               "collab_extrap" = expression(hat(tau)[collab]), 
+               "or"  = expression(hat(bar(tau))))
+  ) +
+  theme_minimal() + 
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 14, face = "bold")) + 
+  labs(x="", y="")
+ggsave(filename=paste(PATH, "mse_plot_sim.png", sep=""))
+```
+
+```{r}
+# CI table
+plot_df %>%
+  filter((metric %in% c("cvg_bar", "widths") & estimator=="or") | (metric %in% c("cvg", "widths") & estimator %in% c("aipsw_extrap", "collab_extrap"))) %>%
+  pivot_wider(names_from=c(estimator, metric), values_from=value)
+```
+
+
+```{r}
+
+```
+
+
+
+

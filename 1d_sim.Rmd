@@ -1,0 +1,602 @@
+---
+title: "1d_sim"
+author: "Harrison Li"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+\newcommand{\aipsw}{\textnormal{aipsw}}
+\newcommand{\or}{\textnormal{or}}
+\newcommand{\collab}{\textnormal{collab}}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(caret)
+library(gam)
+library(SuperLearner) 
+library(grf)
+library(tidyverse)
+library(ggpattern)
+PATH <- "/Users/harrisonli/Documents/GitHub.nosync/calibrating_large_scale_observations/"
+source(paste0(PATH, "helpers.R"))
+```
+
+# Specify DGP
+
+```{r}
+# Specify Delta(x), based on Kallus et al. (2018)
+Delta_fun <- function(x) {
+  return(0.75*x^2 + 3*x + 1)
+}
+```
+
+```{r}
+# Specify m_q(x) = E[Y | X=x, Q=q], as defined in Section 4
+# In the notation of the rest of the paper, m_2(x) = \mu(x)
+# and m_1(x)-m_0(x) = Delta(x)
+m_fun <- function(x, q, interact, beta) {
+  len_check <- check_len_two(beta)
+  x <- as.numeric(x)
+  Delta <- Delta_fun(x)
+  m0 <- 1 + x + 0.5*x^2
+  m1 <- m0 + Delta
+  m2 <- beta[1] + beta[2] * Delta + interact*x
+  return((q==0)*m0 + (q==1)*m1 + (q==2)*m2)
+}
+```
+
+```{r}
+# Specify \bar{mu}(x)
+mu_bar_fun <- function(x, beta_bar) {
+  n <- length(x)
+  Delta_mat <- cbind(rep(1, n), Delta_fun(x))
+  return(Delta_mat %*% beta_bar)
+}
+```
+
+```{r}
+# Specify r(x) = P(Q=1 | X=x, Q!=2), from Kallus et al. (2018)
+r_fun <- function(x) {
+  x <- as.numeric(x)
+  return(rep(0.5, length(x)))
+}
+```
+
+```{r}
+# Specify \pi(x) = P(Q=2 | X=x)
+pi_fun <- function(x, n, N, mu0, mu1, var0, var1) {
+  rho <- n / (n + N)
+  x <- as.numeric(x)
+  f_rct <- dnorm(x, mean=mu1, sd=sqrt(var1))
+  f_obs <- dnorm(x, mean=mu0, sd=sqrt(var0))
+  x_den <- f_rct * rho + f_obs * (1-rho)
+  return((f_rct * rho) / x_den) # Bayes' rule
+}
+```
+
+```{r}
+## Densities of covariate distributions
+x_rct_density <- function(x, mu1, var1) { 
+  dnorm(x, mean=mu1, sd=sqrt(var1)) 
+}
+x_obs_density <- function(x, mu0, var0) {
+  dnorm(x, mean=mu0, sd=sqrt(var0))
+}
+```
+
+```{r}
+# Compute true params for simulations
+get_true_params <- function(beta, interact, mu0, mu1, var0, var1) {
+  len_check <- check_len_two(beta)
+  
+  ## Instantiate covariate densities
+  f_rct <- function(x) x_rct_density(x, mu1, var1)
+  f_obs <- function(x) x_obs_density(x, mu0, var0)
+
+  ## E_{obs}[\Delta(X)]
+  Delta_mean_obs <- integrate(f=function(x) Delta_fun(x)*f_obs(x), lower=-Inf, upper=Inf)$value
+  
+  ## True ATE on target population
+  tau <- beta[1] + beta[2] * Delta_mean_obs + interact * mu0
+  
+  ## E_{rct}[\Delta(X)^k], k=1,2
+  Delta_mean_rct <- integrate(f=function(x) Delta_fun(x)*f_rct(x), lower=-Inf, upper=Inf)$value
+  Delta_sq_mean_rct <- integrate(f=function(x) Delta_fun(x)^2*f_rct(x), lower=-Inf, upper=Inf)$value
+  
+  ## True ATE in RCT population
+  mean_y_rct <- beta[1] + beta[2] * Delta_mean_rct + interact * mu1 
+  
+  ## E_{rct}[X\Delta(X)]
+  interact_Delta_mean_rct <- integrate(f=function(x) Delta_fun(x)*x*f_rct(x), lower=-Inf, upper=Inf)$value
+  
+  ## E_{rct}[Y\Delta(X)] = E_{rct}[\mu(X)*\Delta(X)]
+  mean_y_Delta_rct <- beta[1] * Delta_mean_rct + beta[2] * Delta_sq_mean_rct + interact * interact_Delta_mean_rct
+  
+  ## Compute beta_bar
+  Mat <- matrix(c(1, Delta_mean_rct,
+                  Delta_mean_rct, Delta_sq_mean_rct), nrow=2)
+  beta_bar <- (solve(Mat) %*% c(mean_y_rct, mean_y_Delta_rct))
+  
+  ## Projected ATE
+  tau_bar <- beta_bar[1] + beta_bar[2] * Delta_mean_obs 
+  
+  return(list(tau=tau, tau_bar=tau_bar, beta_bar=beta_bar))
+}
+```
+
+
+```{r}
+# return a function giving weights w(x) s.t. \bar{\tau} = E_{obs}[w(X)\mu(X)]
+# the weights w(x) are chosen to have minimal variance among those considered
+# in Proposition 1
+get_w_fun <- function(beta, interact, mu0, mu1, var0, var1) {
+  f_rct <- function(x) x_rct_density(x, mu1, var1)
+  f_obs <- function(x) x_obs_density(x, mu0, var0)
+  Lam <- function(x) f_rct(x) / f_obs(x)
+  
+  beta_bar <- get_true_params(beta, interact, mu0, mu1, var0, var1)$beta_bar
+  mu_bar_fun <- function(x) beta_bar[1] + beta_bar[2] * Delta_fun(x)
+  mu_fun <- function(x) beta[1] + beta[2] * Delta_fun(x) + interact * x
+  
+  # Set integration bounds +/- 10 SD for numerical stability
+  lower1 <- mu1 - 10*sqrt(var1)
+  upper1 <- mu1 + 10*sqrt(var1)
+  lower0 <- mu0 - 10*sqrt(var0)
+  upper0 <- mu0 + 10*sqrt(var0)
+  A11 <- integrate(f=function(x) Lam(x)*f_rct(x)*(mu_fun(x)-mu_bar_fun(x))^2,
+                   lower=lower1, upper=upper1)$value
+  A12 <- integrate(f=function(x) Lam(x)*f_rct(x)*(mu_fun(x)-mu_bar_fun(x))^2*Delta_fun(x),
+                   lower=lower1, upper=upper1)$value
+  A22 <- integrate(f=function(x) Lam(x)*f_rct(x)*(mu_fun(x)-mu_bar_fun(x))^2*Delta_fun(x)^2,
+                   lower=lower1, upper=upper1)$value
+  b1 <- integrate(f=function(x) f_rct(x)*mu_fun(x)*(mu_fun(x)-mu_bar_fun(x)),
+                  lower=lower1, upper=upper1)$value
+  b2 <- integrate(f=function(x) f_rct(x)*mu_fun(x)*(mu_fun(x)-mu_bar_fun(x))*Delta_fun(x),
+                  lower=lower1, upper=upper1)$value
+  A <- matrix(c(A11, A12, A12, A22), nrow=2)
+  b <- c(b1, b2)
+  lam_den <- as.numeric(t(b) %*% solve(A) %*% b)
+  lam <- -1 * integrate(f=function(x) f_obs(x)*(mu_fun(x)-mu_bar_fun(x)), lower=lower0, upper=upper0)$value / lam_den
+  gamma <- -1 * lam * (solve(A) %*% b)
+  w_fun <- function(x) 1 - Lam(x) * (mu_fun(x)-mu_bar_fun(x)) * (gamma[1] + gamma[2] * Delta_fun(x))
+  return(w_fun)
+}
+```
+
+```{r}
+# Function to generate simulated data
+gen_data <- function(n, N, mu0, mu1, var0, var1, interact, beta, seed=NULL) {
+
+  ## Generate X
+  set.seed(seed)
+  X_rct <- rnorm(n, mean=mu1, sd=sqrt(var1))
+  X_obs <- rnorm(N, mean=mu0, sd=sqrt(var0))
+
+  ## Instantiate mean functions
+  m0 <- function(x) m_fun(x, 0, interact=interact, beta=beta)
+  m1 <- function(x) m_fun(x, 1, interact=interact, beta=beta)
+  m2 <- function(x) m_fun(x, 2, interact=interact, beta=beta)
+
+  ## Generate y, z
+  y_rct <- m2(X_rct) + rnorm(n, sd=sqrt(1^2+0.5^2))
+  z_obs <- rbinom(n=N, size=1, prob=r_fun(X_obs))
+  y_obs <- z_obs * m1(X_obs) + (1-z_obs) * m0(X_obs) + rnorm(N, sd=sqrt(0.75^2+0.5^2))
+
+  ## Put variables together into single data frame
+  rct_df <- data.frame(X_rct) %>%
+    mutate(y=y_rct, z=0)
+  colnames(rct_df) <- c("x", "y", "z")
+  obs_df <- data.frame(X_obs) %>%
+    mutate(y=y_obs, z=z_obs)
+  colnames(obs_df) <- c("x", "y", "z")
+  return(list(rct_df=rct_df, obs_df=obs_df))
+}
+```
+
+# Run 1d sims
+
+Estimators:
+
+- AIPSW: $\hat{\tau}_{\aipsw} = \frac{1}{n}\sum_{i=1}^n(Y_i-\hat{\mu}(X_i))\frac{n}{N}\hat{q}_{n,N}(X_i) + \frac{1}{N} \sum_{i=n+1}^{n+N} \hat{\mu}(X_i)$
+- Outcome regression: $\hat{\tau}_{\or} = \frac{1}{N} \sum_{i=n+1}^{n+N} \hat{\bar{\mu}}(X_i)$
+- collab: $\hat{\tau}_{\collab} = \frac{1}{n}\sum_{i=1}^n \frac{n}{N}\left[(Y_i-\hat{\mu}(X_i))\hat{g}_{n,N}(X_i) + \frac{\hat{q}_{n,N}(X_i)}{1+\hat{q}_{n,N}(X_i)}(\hat{\mu}(X_i)-\hat{k}(X_i))\right]+ \frac{1}{N} \sum_{i=n+1}^{n+N} \frac{\hat{q}_{n,N}(X_i)\hat{\mu}(X_i) + \hat{k}(X_i)}{1+\hat{q}_{n,N}(X_i)}$
+
+Nuisance estimation procedures
+
+1. `aipsw`, `or`, and `collab`: 
+- Estimate $q_{n,N}$ using logistic GAM, where $q_{n,N}(x) = P(S=0 | X=x) / P(S=1 | X=x)$ is an odds ratio
+- Estimate $\Delta$ via DR learner, with GAM's as base learners and $r$ learned via logistic GAM
+- Estimate $\mu$ via simple linear regression of $y$ in RCT on $\hat{\Delta}(x)$ (this is really estimating $\bar{\mu}$)
+- Estimate $g$, $k$ using logistic GAM (for `collab` only). Need to figure out why offset...
+2. `aipsw_extrap`, `or_extrap`, and `collab_extrap`:
+- Estimate $q_{n,N}$ using logistic GAM
+- Estimate $\Delta$ via DR learner, with GAM's as base learners and $r$ learned via logistic GAM
+- Estimate $\mu$ via superlearner to predict $y$ in RCT from $x$ and $\hat{\Delta}(x)$ (extrapolates!)
+- Estimate $g$, $k$ using logistic GAM and estimated $\mu$, $q_{n,N}$ (for `collab` only). Need to figure out offset issue from semi-supervised paper...
+3. `aipsw_oracle`, `or_oracle`: 
+- Assume $q_{n,N}$, $\Delta$, $\mu$ all known
+4. `or_Delta_oracle`
+- Estimate $\bar{\mu}$ via simple linear regression of $y$ in RCT on true $\Delta(x)$
+5. `or_bar_oracle`
+- Uses true $\bar{\mu}$ (differs from `or_oracle` which uses true $\mu$)
+
+Top line should be comparing estimation of $\tau$ by `aipsw_extrap` and `collab_extrap` vs. estimation of $\bar{\tau}$ with `or`.
+
+We can also compare `or` vs. `or_Delta_oracle` to verify that estimation of $\Delta$ is asymptotically negligible.
+
+```{r}
+run_1d_sims <- function(n_sims, n, N, mu0, mu1, var0, var1, interact, beta, 
+                        init_seed=NULL) {
+  
+  # Preallocate data frames for estimators and CI's
+  aipsw <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                      ci_upper=rep(NA, n_sims))
+  or <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                   ci_upper=rep(NA, n_sims))
+  collab <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                        ci_upper=rep(NA, n_sims))
+  aipsw_extrap <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                            ci_upper=rep(NA, n_sims))
+  or_extrap <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                         ci_upper=rep(NA, n_sims))
+  collab_extrap <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                               ci_upper=rep(NA, n_sims))
+  aipsw_oracle <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                             ci_upper=rep(NA, n_sims))
+  or_oracle <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                          ci_upper=rep(NA, n_sims))
+  or_bar_oracle <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                              ci_upper=rep(NA, n_sims))
+  or_Delta_oracle <- data.frame(theta_hat=rep(NA, n_sims), ci_lower=rep(NA, n_sims),
+                              ci_upper=rep(NA, n_sims))
+  beta_hats <- matrix(NA, nrow=n_sims, ncol=2)
+  
+  for (i in 1:n_sims) {
+    ## Set seed
+    if (is.null(init_seed)) {
+      curr_seed <- NULL
+    } else {
+      curr_seed <- init_seed + i - 1
+    }
+    
+    ## Generate simulated data
+    data <- gen_data(n=n, N=N, mu0=mu0, mu1=mu1, var0=var0, var1=var1, 
+                     interact=interact, beta=beta, seed=curr_seed)
+    rct_df <- data$rct_df
+    obs_df <- data$obs_df
+    all_df <- rbind(rct_df, obs_df)
+    all_df$s <- c(rep(1, n), rep(0, N))
+      
+    ## Compute nuisance estimates
+    ## learn pi via logistic GAM
+    pi_hat_model <- mgcv::gam(s ~ s(x), data=all_df, family=binomial(link="logit"))
+    all_df$pi_hat <- predict(pi_hat_model, type="response")
+    
+    ## learn r
+    x_rct <- rct_df$x
+    x_obs <- obs_df$x
+    x_obs_ctl <- as.matrix(x_obs[obs_df$z==0])
+    r_hat_model <- mgcv::gam(z ~ s(x), data=all_df[all_df$s==0,], 
+                       family=binomial(link="logit"))
+    all_df$r_hat <- predict(r_hat_model, newdata=all_df, type="response")
+
+    ## learn Delta via DR learner
+    obs_df <- all_df[all_df$s==0,]
+    a01 <- all_df[all_df$s==0 & all_df$z==1,]
+    a00 <- all_df[all_df$s==0 & all_df$z==0,]
+    m01_model <- mgcv::gam(y ~ s(x), data=a01)
+    m00_model <- mgcv::gam(y ~ s(x), data=a00)
+    obs_df$m01_hat <- predict(m01_model, newdata=obs_df)
+    obs_df$m00_hat <- predict(m00_model, newdata=obs_df)
+    obs_df$m_hat <- with(obs_df, z*m01_hat + (1-z)*m00_hat)
+    obs_df$po <- with(obs_df, (z-r_hat)/(r_hat*(1-r_hat)) * (y-m_hat) + m01_hat-m00_hat)
+    Delta_model <- mgcv::gam(po ~ s(x), data=obs_df)
+    all_df$Delta_hat <- predict(Delta_model, newdata=all_df)
+
+    ## estimate beta, and use to estimate m1
+    naive_lm <- lm(y ~ Delta_hat, data=all_df, subset=all_df$s==1)
+    beta_hat <- coef(naive_lm)
+    all_df$mu_hat <- beta_hat[1] + beta_hat[2] * all_df$Delta_hat
+
+    ## estimate g via logistic gam with offset
+    all_df$offset <- qlogis(n / (n+N))
+    g_hat_reg <- mgcv::gam(s ~ s(mu_hat) + offset(offset), family=binomial(link=logit),
+                           data=all_df)
+    all_df$g_hat <- predict(g_hat_reg, type="response")
+
+    ## estimate k via GAM
+    k_hat_reg <- mgcv::gam(mu_hat ~ s(pi_hat), data=all_df)
+    all_df$k_hat <- predict(k_hat_reg, type="response")
+
+    ## estimate m1 as a function of both x and Delta_hat(x), and extrapolate
+    ## residualization approach
+    ## this is what you would do if you believed there is some overlap
+    m1_reg <- SuperLearner(Y=rct_df$y, X=all_df[all_df$s==1, c("x", "Delta_hat")], 
+                           SL.library=c("SL.glmnet", "SL.earth", "SL.randomForest", "SL.svm"))
+    all_df_extrap <- all_df
+    all_df_extrap$mu_hat <- as.numeric(predict(m1_reg, newdata=all_df_extrap[,c("x", "Delta_hat")])$pred)
+    
+    ## estimate g_hat via logistic gam with offset
+    all_df_extrap$offset <- qlogis(n / (n+N))
+    g_hat_reg_extrap <- tryCatch (
+      {
+        mgcv::gam(s ~ s(mu_hat) + offset(offset), 
+                  family=binomial(link=logit),
+                  data=all_df_extrap)
+      },
+      error = function(e) {
+        message("GAM failed, fitting ordinary logistic regression instead.")
+        mgcv::gam(s ~ mu_hat + offset(offset), 
+                  family=binomial(link=logit),
+                  data=all_df_extrap)
+      }
+    )
+    all_df_extrap$g_hat <- predict(g_hat_reg_extrap, type="response")
+
+    ## estimate k_hat via GAM
+    k_hat_reg_extrap <- tryCatch(
+      {
+        mgcv::gam(mu_hat ~ s(pi_hat), data=all_df_extrap)
+      },
+      error = function(e) {
+        message("GAM failed, fitting ordinary linear regression instead.")
+        mgcv::gam(mu_hat ~ pi_hat, data=all_df_extrap)
+      }
+    )
+    all_df_extrap$k_hat <- predict(k_hat_reg_extrap, type="response")
+    
+    ## generate oracle data frame (knows all nuisance functions)
+    all_df_oracle <- all_df[,c("s", "y", "x")]
+    all_df_oracle$Delta_hat <- Delta_fun(all_df_oracle[,"x"])
+    all_df_oracle$pi_hat <- pi_fun(all_df_oracle[,"x"], n=n, N=N, mu0=mu0, mu1=mu1, var0=var0, var1=var1)
+    all_df_oracle$mu_hat <- m_fun(all_df_oracle[,"x"], q=2, interact=interact, beta=beta)
+    
+    ## generate oracle Delta data frame (knows Delta)
+    naive_lm <- lm(y ~ Delta_hat, data=all_df_oracle, subset=all_df_oracle$s==1)
+    beta_hat_Delta_oracle <- coef(naive_lm)
+    all_df_oracle_Delta <- all_df_oracle
+    all_df_oracle_Delta$mu_hat <- beta_hat_Delta_oracle[1] + beta_hat_Delta_oracle[2] * all_df_oracle_Delta$Delta_hat
+    
+    ## generate oracle data frame for outcome regression bar
+    all_df_oracle_bar <- all_df_oracle
+    oracle_params <- get_true_params(beta=beta, interact=interact,
+                                     mu0=mu0, mu1=mu1, var0=var0, var1=var1)
+    all_df_oracle_bar$mu_hat <- oracle_params$beta_bar[1] + oracle_params$beta_bar[2] * all_df_oracle_bar$Delta_hat
+    
+    # Compute final estimators
+    aipsw[i,] <- compute_estimator_and_ci(all_df, type="aipsw")
+    aipsw_extrap[i,] <- compute_estimator_and_ci(all_df_extrap, type="aipsw")
+    aipsw_oracle[i,] <- compute_estimator_and_ci(all_df_oracle, type="aipsw")
+    collab[i,] <- compute_estimator_and_ci(all_df, type="collab")
+    collab_extrap[i,] <- compute_estimator_and_ci(all_df_extrap, type="collab")
+    or[i,] <- compute_estimator_and_ci(all_df, type="or")
+    or_extrap[i,] <- compute_estimator_and_ci(all_df_extrap, type="or")
+    or_oracle[i,] <- compute_estimator_and_ci(all_df_oracle, type="or")
+    or_bar_oracle[i,] <- compute_estimator_and_ci(all_df_oracle_bar, type="or") # knows true m1
+    or_Delta_oracle[i,] <- compute_estimator_and_ci(all_df_oracle_Delta, type="or") # knows true Delta_0 and estimates tau_bar
+    
+    # Store beta_hat
+    beta_hats[i,] <- beta_hat
+  }
+  sim_params <- list(n=n, N=N, mu0=mu0, mu1=mu1, var0=var0, var1=var1, 
+                     interact=interact, beta=beta, init_seed=init_seed)
+  return(list(aipsw=aipsw, collab=collab, or=or, 
+              aipsw_extrap=aipsw_extrap, collab_extrap=collab_extrap, or_extrap=or_extrap,
+              aipsw_oracle=aipsw_oracle, or_oracle=or_oracle, or_bar_oracle=or_bar_oracle,
+              or_Delta_oracle=or_Delta_oracle, beta_hats=beta_hats, sim_params=sim_params))
+}
+```
+
+```{r}
+theta_list <- c(0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
+n_params <- length(theta_list)
+```
+
+```{r}
+# # Run sims
+# sim_results <- vector("list", length(theta_list))
+# for (i in 1:n_params) {
+#   theta <- theta_list[i]
+#   cat("theta =", theta, "\n")
+#   sim_params <- list(n_sims=1000, n=100, N=10000, mu0=0, mu1=-1*theta, var0=1, 
+#                      var1=1-theta, interact=-1, beta=c(0, 1), init_seed=1)
+#   sim_results[[i]] <- do.call(run_1d_sims, sim_params)
+# }
+```
+
+```{r}
+# # Save results
+# saveRDS(sim_results, paste0(PATH, "sim_results_1d.rds"))
+```
+
+# Evaluate sim results
+
+```{r}
+evaluate_sim_results <- function(sim_res) {
+  sim_params <- sim_res$sim_params
+  rho <- with(sim_params, n/(n+N))
+  
+  params <- with(sim_params, get_true_params(beta, interact, mu0, mu1, var0, var1))
+  
+  # Compute summary stats
+  sim_ests <- sim_res[1:(length(sim_res)-2)]
+  mse <- sapply(sim_ests, function(est_df) mean((est_df$theta_hat-params$tau)^2))
+  mse_bar <- sapply(sim_ests, function(est_df) mean((est_df$theta_hat-params$tau_bar)^2))
+  bias <- sapply(sim_ests, function(est_df) mean(est_df$theta_hat) - params$tau)
+  bias_bar <- sapply(sim_ests, function(est_df) mean(est_df$theta_hat) - params$tau_bar)
+  vrnce <- sapply(sim_ests, function(est_df) var(est_df$theta_hat))
+  cvg <- sapply(sim_ests, function(est_df) mean((est_df$ci_lower <= params$tau & est_df$ci_upper >= params$tau)))
+  cvg_bar <- sapply(sim_ests, function(est_df) mean((est_df$ci_lower <= params$tau_bar & est_df$ci_upper >= params$tau_bar)))
+  widths <- sapply(sim_ests, function(est_df) mean(est_df$ci_upper - est_df$ci_lower))
+  
+  # beta_bar
+  n_sim <- nrow(sim_ests[[1]])
+  beta_hat_bar_df <- data.frame(int_mean=mean(sim_res$beta_hats[,1]),
+                                slope_mean=mean(sim_res$beta_hats[,2]),
+                                int_se=sd(sim_res$beta_hats[,1])/sqrt(n_sim),
+                                slope_se=sd(sim_res$beta_hats[,2])/sqrt(n_sim),
+                                int_bar=params$beta_bar[1],
+                                slope_bar=params$beta_bar[2])
+  # Aggregate results into data frame
+  res_df <- data.frame(mse=mse, mse_bar=mse_bar, bias=bias, bias_bar=bias_bar,
+                       vrnce=vrnce, cvg=cvg, cvg_bar=cvg_bar, widths=widths)
+  return(list(res_df=res_df, beta_hat_bar_df=beta_hat_bar_df, 
+              beta_hats=sim_res$beta_hats, sim_params=sim_params,
+              params=params))
+}
+```
+
+## Plot results
+
+```{r}
+sim_results <- readRDS(paste0(PATH, "sim_results_1d.rds"))
+```
+
+```{r}
+# Function to compute and plot weights
+plot_wts <- function(eval_results, n) {
+  
+  ## Generate x
+  z <- seq(-4, 4, length.out=n)
+  
+  ## Compute weights
+  wt_dfs <- lapply(eval_results, function(res) {
+    wt_fun <- with(res$sim_params, get_w_fun(beta, interact, mu0, mu1, var0, var1))
+    x <- with(res$sim_params, sqrt(var0)*z + mu0)
+    all_wts <- wt_fun(x)
+    return(data.frame(x=x, w=all_wts, theta=-1*res$sim_params$mu1))
+  })
+
+  all_wt_df <- do.call(rbind, wt_dfs)
+  
+  ## Plot weights using faceting
+  wt_plot <- all_wt_df %>%
+    ggplot(aes(x=x, y=w)) +
+    geom_line() +
+    facet_wrap(~theta, labeller = labeller(theta = function(x) paste(expression(theta), "=", x))) +
+    labs(x="x", y="weight") +
+    scale_y_continuous(limits=c(0, 2),)
+  return(wt_plot)
+}
+```
+
+
+```{r}
+## Function to convert eval results to a dataframe for plotting
+convert_to_plot_df <- function(eval_results, colnames) {
+  res_list <- lapply(eval_results, function(res) {
+    raw_df <- as.data.frame(res$res_df[colnames])
+    stopifnot(!any(grepl(";", colnames(raw_df))))
+    colnames(raw_df) <- paste(colnames(raw_df), -1*res$sim_params$mu1, sep=";")
+    return(raw_df)
+  })
+  plot_df <- do.call(cbind, res_list) %>%
+    rownames_to_column(var="estimator") %>%
+    pivot_longer(cols=-c("estimator"), names_to=c("metric", "theta"), 
+                 names_sep=";", values_to="value")
+  return(plot_df)
+}
+```
+
+```{r}
+# Process results
+# options(scipen=999)
+eval_results <- lapply(sim_results, evaluate_sim_results)
+```
+
+```{r}
+# Generate plot df
+plot_df <- convert_to_plot_df(eval_results,
+                              colnames=c("mse", "mse_bar", "cvg", "cvg_bar", "bias", "bias_bar", "vrnce", "widths"))
+```
+
+
+```{r}
+# MSE plot
+plot_df %>%
+  filter((metric %in% c("vrnce", "bias_bar") & estimator == "or") | (metric %in% c("vrnce", "bias") & estimator %in% c("aipsw_extrap", "collab_extrap"))) %>%
+  mutate(metric=ifelse(metric=="vrnce", "vrnce", "bias_sq"),
+         value=ifelse(metric=="bias_sq", value^2, value)) %>% # get sq. bias
+  ggplot(aes(x=estimator, y=value, fill=estimator, alpha=metric)) +
+  facet_wrap(~ theta, nrow=2, scales="free",
+             labeller=label_bquote(col = theta == .(theta))) +
+  geom_col(position="stack", color="black") +
+  scale_alpha_manual(
+    values = c("vrnce" = 1, "bias_sq" = 0),
+    guide = "none" # Hide the fill legend if it's confusing
+  ) +
+  scale_fill_brewer(
+    palette = "Set1",
+    labels = c("aipsw_extrap" = expression(hat(tau)[aipsw]), 
+               "collab_extrap" = expression(hat(tau)[collab]), 
+               "or"  = expression(hat(bar(tau))))
+  ) +
+  theme_minimal() + 
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 14, face = "bold")) + 
+  labs(x="", y="")
+ggsave(filename=paste(PATH, "mse_plot_1d_sim.png", sep=""))
+```
+
+
+
+```{r}
+# CI table
+plot_df %>%
+  filter((metric %in% c("cvg_bar", "widths") & estimator=="or") | (metric %in% c("cvg", "widths") & estimator %in% c("aipsw_extrap", "collab_extrap"))) %>%
+  pivot_wider(names_from=c(estimator, metric), values_from=value)
+```
+
+```{r}
+# CI table
+plot_df %>%
+  filter((metric %in% c("cvg_bar", "width") & estimator=="or") | (metric == "cvg") & (estimator %in% c("aipsw_extrap", "collab_extrap"))) %>%
+  select(-metric) %>%
+  pivot_wider(names_from=estimator, values_from=value)
+```
+
+```{r}
+# Compare oracle and non-oracle MSE
+plot_df %>%
+  filter((metric=="mse_bar" & estimator %in% c("or", "or_Delta_oracle")) |
+         (metric=="mse" & estimator %in% c("aipsw", "aipsw_oracle"))) %>%
+  select(-metric) %>%
+  pivot_wider(names_from=estimator, values_from=value) %>%
+  transmute(theta=theta, aipsw=aipsw/aipsw_oracle, or=or/or_Delta_oracle)
+```
+
+```{r}
+# Weight plots
+wt_fun_list <- lapply(eval_results, function(res) {
+  params <- res$sim_params
+  wts <- with(params, get_w_fun(beta=beta, interact=interact, mu0=mu0, mu1=mu1, 
+                                var0=var0, var1=var1))
+  return(wts)
+})
+x_wt <- seq(-4, 4, length.out=1000)
+wts <- data.frame(sapply(wt_fun_list, function(wt_fun) wt_fun(x_wt)))
+names(wts) <- theta_list
+wts$x <- x_wt
+wt_plot <- wts %>% 
+  pivot_longer(cols=-x, names_to="theta", values_to="wt") %>%
+  ggplot(aes(x=x, y=wt)) +
+  geom_line(color="red") +
+  geom_abline(slope=0, intercept=1, linetype="dotted", color="black") +
+  facet_wrap(~ theta, nrow=2,
+             labeller=label_bquote(col = theta == .(theta))) +
+  theme_minimal() + 
+  theme(strip.text = element_text(size = 14, face = "bold")) + 
+  labs(x="x", y="") +
+  scale_y_continuous(limits = c(0, 2))
+ggsave(filename=paste(PATH, "wt_plot_1d_sim.png", sep=""))
+```
+
+```{r}
+
+```
+
+
