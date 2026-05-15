@@ -1,0 +1,365 @@
+---
+title: "rotation_analysis"
+author: "Harrison Li"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+PATH <- "/Users/harrisonli/Documents/GitHub.nosync/calibrating_large_scale_observations/" 
+library(readxl)
+library(SuperLearner)
+library(glmnet)
+library(grf)
+library(lme4)
+library(tidyverse)
+library(mgcv)
+library(gridExtra)
+library(patchwork)
+source(paste0(PATH, "helpers.R"))
+```
+
+## Global constants
+
+```{r}
+K_cf <- 5 # number of cross-fitting folds
+n_sims <- 100 # number of simulations
+n_trees <- 200 # number of trees for causal forests
+```
+
+## Initial data processing
+
+```{r}
+## Read in previous year covariates
+load(paste0(PATH, "Covariates_at_exp_sitesSep19.RData"))
+output_df_raw <- output_df %>%
+  select(site, year, previous_year_prEarly, previous_year_pr_grow)
+```
+
+```{r}
+## Read in experimental data
+rct_df_raw <- read_csv(paste0(PATH, "CornRotationBenefitsExperimentalCalibrationDataWithSoil.csv"))[,-1] %>%
+   mutate(site=recode_factor(site,
+                            SD="Bowles_SD",
+                            NE="Bowles_NE",
+                            OH1="Bowles_OH1",
+                            OH2="Bowles_OH2",
+                            ARL="SCCAP_ARL_WI",
+                            FREEMAN="SCCAP_FREEMAN_MO",
+                            LAN="SCCAP_LAN_WI",
+                            MAR="SCCAP_MAR_WI",
+                            NWREC="SCCAP_NWERC_IL",
+                            ORR="SCCAP_ORR_IL",
+                            SERF="SCCAP_SERF_IA")) %>%
+  rename(y=ECRB_Exp) %>%
+  left_join(output_df_raw, by=c("site", "year")) %>%
+  drop_na(y)
+
+## Make sure all previous year covariates joined with a match
+stopifnot(sum(is.na(select(rct_df_raw, starts_with("previous_year")))) == 0) 
+rct_df_raw
+```
+
+```{r}
+## Read in observational data
+obs_df_raw <- read_csv(paste0(PATH, "CornRotationBenefitsEstimates.csv")) %>%
+  mutate(z=if_else(previous_year=="Soybeans", 1, 0)) %>%
+  rename(y=yield_tha)
+obs_df_raw
+```
+
+```{r}
+## Determine covariate columns
+x_names <- intersect(names(rct_df_raw), names(obs_df_raw))
+x_names <- x_names[!(x_names %in% c("ECRB_Sat_ERL", "ECRB_Sat_v2", "y", "z"))]
+x_names # same as in Kluger et al. (2023)
+```
+
+```{r}
+## Data check
+## Random effects calibration matches published results in Kluger et al. (2022)
+calib_model <- lmer(y ~ (1 | year) + (1 | site) + ECRB_Sat_ERL, data=rct_df_raw)
+calib_model
+```
+
+```{r}
+# Remove some extra columns
+rct_df_all <- rct_df_raw %>%
+  mutate(z=0)  %>% # not used 
+  select(any_of(x_names), y, z)
+obs_df_all <- select(obs_df_raw, any_of(x_names), y, z)
+```
+
+```{r}
+# Set aside 90% of observations for validation
+set.seed(1)
+n_obs_raw <- nrow(obs_df_raw)
+obs_tau_ind <- sample(n_obs_raw, size=round(0.9*n_obs_raw), replace=FALSE)
+obs_df_tau <- obs_df_raw[obs_tau_ind,]
+obs_df_sim <- obs_df_raw[-obs_tau_ind,]
+```
+
+
+## Run simulations
+
+```{r}
+## Compute the three estimators
+## Args
+# rct_df: RCT df
+# obs_df: Observational df
+# x_names: Vector of covariate names
+# K_cf: Number of cross-fitting folds (for learning mu_hat via extrapolation)
+# seed: Random seed
+# n_trees: Number of trees for causal forest
+run_data_sim <- function(rct_df, obs_df, x_names, K_cf, seed, n_trees) {
+  ## Check datasets contain all covariates
+  stopifnot(all(x_names %in% names(rct_df)))
+  stopifnot(all(x_names %in% names(obs_df)))
+  
+  ## Estimate Delta via causal forest
+  Delta_hat_model <- causal_forest(X=obs_df[,x_names], Y=obs_df$y, 
+                                   W=obs_df$z, seed=seed, num.trees=n_trees)
+  
+  ## Compute predictions of Delta
+  rct_df$Delta_hat <- predict(Delta_hat_model, newdata=rct_df[,x_names])$predictions
+  obs_df$Delta_hat <- predict(Delta_hat_model)$predictions # OOB, no cross-fitting needed
+
+  ## Combine RCT and observational data
+  n <- nrow(rct_df)
+  N <- nrow(obs_df)
+  all_df <- rbind(rct_df, obs_df) %>%
+    mutate(s=c(rep(1, n), rep(0, N))) # dataset indicator
+  
+  ## Estimate mu_bar via OLS calibration
+  ols_calib_model <- lm(y ~ Delta_hat, data=rct_df)
+  summary(ols_calib_model)
+  beta_hat <- coef(ols_calib_model)
+  all_df$mu_hat <- beta_hat[1] + beta_hat[2] * all_df$Delta_hat
+  
+  ## Estimate nuisance parameters for AIPSW and collaborative
+  all_df_extrap <- all_df
+  all_df_extrap$mu_hat <- NA
+  
+  ## Estimate pi using logistic LASSO with second order lat/lon expansion
+  x_train <- model.matrix(s ~ 0+(.-latitude-longitude)+poly(latitude, 2)*poly(longitude, 2),
+                          data=all_df_extrap[,c("s", x_names)])
+  y_train <- all_df_extrap$s
+  pi_model <- cv.glmnet(x=x_train, y=y_train, family="binomial")
+  all_df_extrap$pi_hat <- as.numeric(predict(pi_model, newx=x_train,
+                                             type="response", s="lambda.min"))
+  
+  ## Split RCT and observational datasets
+  rct_df_extrap <- all_df_extrap[all_df_extrap$s==1,]
+  obs_df_extrap <- all_df_extrap[all_df_extrap$s==0,]
+  
+  ## Estimate mu_hat via cross-fit superlearner
+  rct_fold_inds <- get_fold_inds(n=n, K=K_cf, seed=seed) # RCT cross-fitting folds
+  rct_df_extrap$mu_hat <- NA
+  mu_models <- vector("list", K_cf)
+  set.seed(seed)
+  for (k in 1:K_cf) {
+    fold_inds <- rct_fold_inds == k
+    curr_train <- rct_df_extrap[!fold_inds,]
+    curr_val <- rct_df_extrap[fold_inds,]
+    mu_model_extrap <- SuperLearner(Y=curr_train$y, 
+                                    X=curr_train[,c(x_names, "Delta_hat")], 
+                                    SL.library=c("SL.glmnet", "SL.earth", 
+                                                 "SL.randomForest", "SL.svm"))
+    mu_models[[k]] <- mu_model_extrap
+    rct_df_extrap$mu_hat[fold_inds] <- predict(mu_model_extrap, 
+                                               newdata=curr_val[,c(x_names, "Delta_hat")])$pred
+  }
+  
+  ## Compute predictions on observational dataset by averaging predictions from all K_cf cross-fit models
+  obs_df_extrap$mu_hat <- rowMeans(sapply(mu_models, function(m) predict(m, newdata=obs_df_extrap[,c(x_names, "Delta_hat")])$pred))
+  
+  ## Recombine RCT and observational datasets
+  all_df_extrap <- rbind(rct_df_extrap, obs_df_extrap)
+  
+  ## Learn g_hat
+  g_hat_reg <- mgcv::gam(s ~ s(mu_hat), family=binomial(), data=all_df_extrap)
+  all_df_extrap$g_hat <- predict(g_hat_reg, type="response")
+  
+  ## Learn k_hat
+  if (sum(coef(pi_model, s="lambda.min") != 0) > 1) {
+    k_hat_model <- mgcv::gam(mu_hat ~ s(pi_hat), data=all_df_extrap)
+    all_df_extrap$k_hat <- predict(k_hat_model, type="response")
+  } else {
+    # Constant pi_hat
+    warning("pi_hat is constant")
+    all_df_extrap$k_hat <- mean(all_df_extrap$mu_hat)
+  }
+ 
+  ## Compute estimators and CI's
+  or <- as.numeric(compute_estimator_and_ci(all_df, type="or", normalize=FALSE))
+  aipsw <- as.numeric(compute_estimator_and_ci(all_df_extrap, type="aipsw", normalize=FALSE))
+  collab <- as.numeric(compute_estimator_and_ci(all_df_extrap, type="collab", normalize=FALSE))
+  
+  return(list(or=or, aipsw=aipsw, collab=collab))
+}
+```
+
+```{r}
+# or <- setNames(as.data.frame(matrix(NA, nrow=n_sims, ncol=3)),
+#                c("point_est", "ci_lower", "ci_upper"))
+# aipsw <- setNames(as.data.frame(matrix(NA, nrow=n_sims, ncol=3)),
+#                   c("point_est", "ci_lower", "ci_upper"))
+# collab <- setNames(as.data.frame(matrix(NA, nrow=n_sims, ncol=3)),
+#                    c("point_est", "ci_lower", "ci_upper"))
+# n_rct <- nrow(rct_df_all)
+# n_obs <- nrow(obs_df_all)
+# rct_samp_size <- trunc(n_rct / 10)
+# obs_samp_size <- trunc(n_obs / 10)
+# for (i in 1:n_sims) {
+#   print(paste("Simulation", i, "of", n_sims))
+#   
+#   set.seed(i)
+#   # Simple random sample 
+#   rct_ind <- sample(n_rct, size=rct_samp_size, replace=FALSE)
+#   obs_ind <- sample(n_obs, size=obs_samp_size, replace=FALSE)
+#   rct_df <- rct_df_all[rct_ind,]
+#   obs_df <- obs_df_all[obs_ind,]
+#   
+#   # # Sample exactly one experiment from each (site, year) pair in experiment
+#   # # and exactly one observation from each site in observational data
+#   # ## Sample from RCT
+#   # rct_df <- rct_df_raw %>%
+#   #   group_by(site, year) %>%
+#   #   slice_sample(n=1) %>%
+#   #   ungroup()
+#   # 
+#   # ## Sample from observations
+#   # obs_df <- obs_df_raw %>%
+#   #   group_by(latitude, longitude) %>%
+#   #   slice_sample(n=1) %>%
+#   #   ungroup()
+#   
+#   ## Subset columns of RCT and observational data
+#   # rct_df <- rct_df %>%
+#   #   mutate(z=0) %>% # RCT fields are paired, not used
+#   #   select(any_of(x_names), y, z)
+#   # obs_df <- obs_df %>%
+#   #   select(any_of(x_names), y, z)
+# 
+#   sim_out <-  run_data_sim(rct_df=rct_df, obs_df=obs_df, x_names=x_names, 
+#                            K_cf=5, seed=i, n_trees=n_trees)
+#   or[i,] <- sim_out$or
+#   aipsw[i,] <- sim_out$aipsw
+#   collab[i,] <- sim_out$collab
+# }
+```
+
+```{r}
+# # Write out
+# write_csv(or, paste0(PATH, "data_or.csv"))
+# write_csv(aipsw, paste0(PATH, "data_aipsw.csv"))
+# write_csv(collab, paste0(PATH, "data_collab.csv"))
+```
+
+## Compute true estimands
+
+```{r}
+# full_sim <- run_data_sim(rct_df=rct_df_all, obs_df=obs_df_all,
+#                          x_names=x_names, K_cf=K_cf, seed=1, n_trees=n_trees)
+# saveRDS(full_sim, paste(PATH, "true_params.rds", sep=""))
+```
+
+```{r}
+full_sim <- readRDS(paste(PATH, "true_params.rds", sep=""))
+tau <- full_sim$aipsw[1]
+tau_bar <- full_sim$or[1]
+```
+
+```{r}
+estimand_info <- data.frame(type=c("aipsw", "collab", "or"),
+                            estimand=c(tau, tau, tau_bar)) %>%
+  mutate(type=fct_relevel(type, "aipsw", "collab", "or"))
+estimand_info
+```
+
+## Process and plot simulation results
+
+```{r}
+aipsw <- read_csv(paste0(PATH, "data_aipsw.csv"))
+or <- read_csv(paste0(PATH, "data_or.csv"))
+collab <- read_csv(paste0(PATH, "data_collab.csv"))
+```
+
+```{r}
+# Save table of point estimates and CI's
+raw_results <- cbind(rbind(aipsw, collab, or),
+      type=rep(c("aipsw", "collab", "or"), each=n_sims))
+all_results <- raw_results %>%
+  pivot_longer(cols=c("point_est", "ci_lower", "ci_upper"),
+               names_to="stat_type",
+               values_to="stat") %>%
+  mutate(type=fct_relevel(type, "aipsw", "collab", "or"),
+         stat_type=fct_relevel(stat_type, "point_est", "ci_lower", "ci_upper")) %>%
+  left_join(estimand_info, by="type")
+```
+
+```{r}
+# Histograms of point estimates
+facet_labels <- c(
+  "aipsw" = "hat(tau)[aipsw]",
+  "collab" = "hat(tau)[collab]",
+  "or"     = "hat(bar(tau))"
+)
+comp_plot <- all_results %>%
+  filter(stat_type=="point_est") %>%
+  ggplot() +
+  geom_histogram(aes(x=stat, fill=type), alpha=0.7) +
+  geom_vline(aes(color=type, xintercept=estimand), color="black", 
+             linewidth=1, linetype="dashed") +
+  scale_fill_brewer(
+    palette = "Set1",
+    labels = c("aipsw" = expression(hat(tau)[aipsw]), 
+               "collab" = expression(hat(tau)[collab]), 
+               "or"  = expression(hat(bar(tau))))
+  ) +
+  facet_wrap(~type, scales="free",
+             labeller=labeller(type = as_labeller(facet_labels, label_parsed))) +
+  labs(x="", y="") +
+  theme(legend.position="none",
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        strip.text = element_text(size = 14, face = "bold"))
+comp_plot
+ggsave(paste(PATH, "crop_rotation_histograms.png", sep=""), comp_plot)
+```
+
+```{r}
+# Summary statistics for point estimates
+all_results %>%
+  filter(stat_type=="point_est") %>%
+  group_by(type) %>%
+  summarise(bias_sq=(mean(stat-estimand))^2, vrnce=var(stat), mse=mean((stat-estimand)^2))
+```
+
+```{r}
+# Coverages for CI's
+raw_results %>%
+  left_join(estimand_info, by="type") %>%
+  group_by(type) %>%
+  summarise(cvg=mean(ci_lower <= estimand & estimand <= ci_upper),
+            mean_width=mean(ci_upper-ci_lower))
+```
+
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
+
