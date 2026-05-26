@@ -1,6 +1,5 @@
 ---
 title: "1d_sim"
-author: "Harrison Li"
 date: "`r Sys.Date()`"
 output: pdf_document
 ---
@@ -20,7 +19,7 @@ library(SuperLearner)
 library(grf)
 library(tidyverse)
 library(ggpattern)
-PATH <- "/Users/harrisonli/Documents/GitHub.nosync/calibrating_large_scale_observations/"
+PATH <- ""
 source(paste0(PATH, "helpers.R"))
 ```
 

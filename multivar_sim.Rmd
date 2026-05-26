@@ -1,6 +1,5 @@
 ---
 title: "multivar_sim"
-author: "Harrison Li"
 date: "`r Sys.Date()`"
 output: pdf_document
 ---
@@ -13,7 +12,7 @@ knitr::opts_chunk$set(echo = TRUE)
 library(SuperLearner)
 library(tidyverse)
 library(grf)
-PATH <- "/Users/harrisonli/Documents/GitHub.nosync/calibrating_large_scale_observations/"
+PATH <- ""
 source(paste0(PATH, "helpers.R"))
 ```
 
